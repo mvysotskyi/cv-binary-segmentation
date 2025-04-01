@@ -1,11 +1,41 @@
 import os
 import torch
-from glob import glob
-
-from torch.utils.data import Dataset
-from torchvision import transforms
-import torchvision.transforms.functional as F
+import random
 from PIL import Image, ImageOps
+import torchvision.transforms.functional as F
+from torchvision import transforms
+from transformers import BeitImageProcessor
+
+
+def prepare_data(images_dir, masks_dir, split_ratio=0.9, seed=42):
+    """
+    Creates pairs of images and masks and splits them into train and validation sets.
+    
+    Args:
+        images_dir (str): Directory containing input images
+        masks_dir (str): Directory containing mask images
+        split_ratio (float): Ratio for train/validation split (default 0.8)
+    
+    Returns:
+        tuple: Lists of train and validation pairs
+    """
+    image_files = sorted([f for f in os.listdir(images_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
+    mask_files = sorted([f for f in os.listdir(masks_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
+    
+    pairs = list(zip(
+        [os.path.join(images_dir, img) for img in image_files],
+        [os.path.join(masks_dir, mask) for mask in mask_files]
+    ))
+    
+    # Random shuffle
+    random.seed(seed)
+    random.shuffle(pairs)
+    
+    split_idx = int(len(pairs) * split_ratio)
+    train_pairs = pairs[:split_idx]
+    val_pairs = pairs[split_idx:]
+    
+    return train_pairs, val_pairs
 
 
 def pad_to_divisible(img, target_size):
@@ -21,11 +51,9 @@ def pad_to_divisible(img, target_size):
     """
     width, height = img.size
 
-    # Calculate new dimensions: smallest multiples of target_size that are >= current dimensions
     new_width = ((width + target_size - 1) // target_size) * target_size
     new_height = ((height + target_size - 1) // target_size) * target_size
 
-    # Determine the padding required on each side
     pad_width = new_width - width
     pad_height = new_height - height
     left = pad_width // 2
@@ -33,66 +61,58 @@ def pad_to_divisible(img, target_size):
     top = pad_height // 2
     bottom = pad_height - top
     coords = (left, top, left + width, top + height)
-    # Select fill color: for RGB images use black (0,0,0), for others assume 0
     fill_color = (0, 0, 0) if img.mode == 'RGB' else 0
 
-    # Pad the image
     padded_img = ImageOps.expand(img, border=(left, top, right, bottom), fill=fill_color)
     return padded_img, coords
 
-def joint_random_crop_and_resize(crop_size, resize_size, flip_prob=0.5):
+def joint_transforms_train(crop_size, flip_prob=0.5):
     def transform(image, mask):
         i, j, h, w = transforms.RandomCrop.get_params(image, output_size=crop_size)
         image = F.crop(image, i, j, h, w)
         mask = F.crop(mask, i, j, h, w)
 
-        # Random horizontal flip
         if torch.rand(1).item() < flip_prob:
             image = F.hflip(image)
             mask = F.hflip(mask)
 
-        # Resize
-        image = F.resize(image, resize_size, Image.BILINEAR)
-        mask = F.resize(mask, resize_size, interpolation=Image.NEAREST)
         return image, mask
     return transform
 
+def joint_transforms_test(crop_size):
+    def transform(image, mask):
+        i, j, h, w = transforms.RandomCrop.get_params(image, output_size=crop_size)
+        image = F.crop(image, i, j, h, w)
+        mask = F.crop(mask, i, j, h, w)
 
-class SegmentationDataset(Dataset):
-    default_image_transforms = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225])
-    ])
-    default_mask_transforms = transforms.ToTensor()
+        return image, mask
+    return transform
 
-    def __init__(self, image_dir, mask_dir, transform=None, mask_transform=None):
-        self.image_paths = sorted(glob(os.path.join(image_dir, '*')))
-        self.mask_paths = sorted(glob(os.path.join(mask_dir, '*')))
-        self.joint_transform = joint_random_crop_and_resize(crop_size=(224, 224), resize_size=(224, 224))
-        self.transform = __class__.default_image_transforms if transform is None else transform
-        self.mask_transform = __class__.default_mask_transforms if mask_transform is None else mask_transform
-        self.train = True
-        assert len(self.image_paths) == len(self.mask_paths), "Mismatch between number of images and masks."
+class SegmentationDataset(torch.utils.data.Dataset):
+    def __init__(self, data_pairs, processor: BeitImageProcessor, joint_pil_transform=None):
+        self.data_pairs = data_pairs
+        self.joint_pil_transform = joint_pil_transform
+        self.processor = processor
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.data_pairs)
     
-    def set_train(self, train=True):
-        self.train = train
-
     def __getitem__(self, idx):
-        image = Image.open(self.image_paths[idx]).convert("RGB")
-        mask = Image.open(self.mask_paths[idx]).convert("L")
+        image_path, mask_path = self.data_pairs[idx]
+        
+        image = Image.open(image_path).convert("RGB")
+        mask = Image.open(mask_path).convert("L")
 
-        mask, coords = pad_to_divisible(mask, 224)
-        image, _ = pad_to_divisible(image, 224)
+        image, _ = pad_to_divisible(image, 384)
+        mask, coords = pad_to_divisible(mask, 384)
+        
+        if self.joint_pil_transform:
+            image, mask = self.joint_pil_transform(image, mask)
 
-        if self.train:
-            image, mask = self.joint_transform(image, mask)
+        image = self.processor(image, return_tensors="pt")["pixel_values"].squeeze(0)
+        mask = transforms.ToTensor()(mask)
+        
+        # if image.shape[2:] != mask.shape[2:]:
+        #     image = F.resize(image, mask.shape[2:], Image.BILINEAR)
 
-        image = self.transform(image)
-        mask = self.mask_transform(mask)
-        mask = (mask > 0.5).float()
-
-        return image, mask, coords
+        return image_path, image, mask, coords

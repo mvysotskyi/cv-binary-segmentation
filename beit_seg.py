@@ -28,10 +28,9 @@ class ThreeLayerCNN(nn.Module):
         return x
 
 class BeitMLASegmentation(nn.Module):
-    def __init__(self, num_classes=1, model_name="microsoft/beit-base-patch16-224-pt22k"):
+    def __init__(self, num_classes=1, model_name="microsoft/beit-base-patch16-384-pt22k"):
         super(BeitMLASegmentation, self).__init__()
         self.model = BeitModel.from_pretrained(model_name, output_hidden_states=True)
-        self.processor = BeitImageProcessor.from_pretrained(model_name)
 
         self.three_layer_cnns = nn.ModuleList([
             ThreeLayerCNN(in_channels=768, mid_channels=384, out_channels=192)
@@ -43,18 +42,13 @@ class BeitMLASegmentation(nn.Module):
             for _ in range(4)
         ])
 
-    def process(self, image):
-        image = image.resize((224, 224))
-        inputs = self.processor(image, return_tensors="pt")
-        return inputs
-
     def forward(self, x):
         outputs = self.model(**x)
         hidden_states = outputs.hidden_states
         hidden_states = [hs for i, hs in enumerate(hidden_states) if (i + 1) % 3 == 0]
         hidden_states = [hs[:, 1:, :] for hs in hidden_states]
 
-        H, W = 224, 224
+        H, W = 384, 384
         C = hidden_states[0].shape[-1]
         hidden_states = [rearrange(hs, "b (h w) c -> b c h w", h=H//16, w=W//16) for hs in hidden_states]
         reshaped_conv = [self.three_layer_cnns[i](hs) for i, hs in enumerate(hidden_states)]

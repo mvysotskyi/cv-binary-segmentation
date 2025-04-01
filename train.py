@@ -1,101 +1,45 @@
 import torch
-import torch.nn as nn
 
-import numpy as np
+import torch.nn as nn
 
 import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
-from torchvision import models
+from transformers import BeitImageProcessor
 
-from dataset import SegmentationDataset
+from dataset import SegmentationDataset, joint_transforms_test, joint_transforms_train, prepare_data, pad_to_divisible
 
 from torchvision import transforms
-from torchvision.transforms import v2
-import torchvision.transforms.functional as F
 
-from unet import UNet
 from beit_seg import BeitMLASegmentation
-# from dataset import transform
 from copy import deepcopy
+from PIL import Image
 
-def get_dataloaders(image_dir, mask_dir, batch_size=4):
-    image_transforms = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                            std=[0.229, 0.224, 0.225])
-    ])
 
-    num_workers = batch_size // 2
-    full_dataset = SegmentationDataset(image_dir, mask_dir, transform=image_transforms)
 
-    train_size = int(0.85 * len(full_dataset))
-    test_size = len(full_dataset) - train_size
-    train_dataset, test_dataset = random_split(full_dataset, [train_size, test_size])
+def get_dataloader(image_dir, mask_dir, processor, batch_size=4):
+    num_workers = batch_size
 
-    train_dataset.dataset.set_train(True)
-    test_dataset.dataset = deepcopy(train_dataset.dataset)
-    test_dataset.dataset.set_train(False)
+    train_pairs, test_pairs = prepare_data(image_dir, mask_dir)
+    train_dataset = SegmentationDataset(train_pairs, processor, joint_pil_transform=joint_transforms_train((384, 384)))
+    test_dataset = SegmentationDataset(test_pairs, processor, joint_pil_transform=joint_transforms_test((384, 384)))
+    test_dataset_full = SegmentationDataset(test_pairs, processor)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=num_workers)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers)
+    test_loader_full = DataLoader(test_dataset_full, batch_size=1, shuffle=False, num_workers=num_workers)
 
-    return train_loader, test_loader
-
-
-# def get_fcn_model(device: str = "cuda"):
-#     model = models.segmentation.fcn_resnet101(pretrained=False, num_classes=1, aux_loss=True)
-#     return model.to(device)
-
-def get_fcn_model(device: str = "cuda"):
-    model = models.segmentation.fcn_resnet101(pretrained=True, aux_loss=True)
-    # model.requires_grad_(False)
-
-    model.classifier[4] = nn.Conv2d(512, 1, kernel_size=(1, 1), stride=(1, 1))
-    model.aux_classifier[4] = nn.Conv2d(256, 1, kernel_size=(1, 1), stride=(1, 1))
-
-    model.to(device)
-    return model
-
-def get_model_unet(device: str = "cuda"):
-    model = UNet(in_channels=3, num_classes=1, depth=5)
-    model.to(device)
-    return model
+    return train_loader, test_loader, test_loader_full
 
 def get_model_beit(device: str = "cuda"):
-    model = BeitMLASegmentation(num_classes=1, model_name="microsoft/beit-base-patch16-224-pt22k")
+    model = BeitMLASegmentation(num_classes=1, model_name="microsoft/beit-base-patch16-384")
     model = model.to(device)
     model.model.requires_grad_(False)
     return model
 
-def call_beit(model, x):
-    # x = 2 * (x - 0.5)
-    # print(x.shape)
-    # Scale the input to the range [0, 1]
-    min_val = x.min()
-    max_val = x.max()
-    x = (x - min_val) / (max_val - min_val)
-    # print(x.shape)
-    inp = {"pixel_values": x}
-    x = model(inp)
-
-    return x
-
-
 def dice_coef(pred, target, smooth=1e-7):
-    """
-    Computes the Dice coefficient.
-    Args:
-        pred (torch.Tensor): Predictions from the model (logits).
-        target (torch.Tensor): Ground truth binary masks.
-        smooth (float): Smoothing constant to avoid division by zero.
-    Returns:
-        dice (float): Dice coefficient.
-    """
-    # Apply sigmoid and threshold the predictions to obtain binary mask
     pred = torch.sigmoid(pred)
     pred = (pred > 0.5).float()
 
-    # Flatten the tensors
     pred_flat = pred.view(-1)
     target_flat = target.view(-1)
     
@@ -104,73 +48,92 @@ def dice_coef(pred, target, smooth=1e-7):
     return dice
 
 
-def sliding_window_inference(image, model, patch_size=256, stride=128, device='cuda'):
-    """
-    Perform patch-based inference on an image using a segmentation model with batching support.
+def sliding_window_inference(image_path, model, processor, patch_size=384, stride=192, device='cuda'):
+    image = Image.open(image_path[0]).convert("RGB")
+    image, _ = pad_to_divisible(image, patch_size)
     
-    Args:
-        image (torch.Tensor): Input image tensor of shape (B, C, H, W).
-        model (torch.nn.Module): Trained PyTorch segmentation model.
-        patch_size (int): Size of each patch.
-        stride (int): Step size for moving the window.
-        device (str): Computation device ('cuda' or 'cpu').
+    # Correct assignment: width (W) and height (H)
+    W, H = image.size  # PIL returns (width, height)
     
-    Returns:
-        torch.Tensor: Segmentation mask of the same spatial dimensions as the input image.
-    """
-    # Get image dimensions
-    H, W = image.shape[2], image.shape[3]
+    # Create the output mask with shape (1, 1, H, W)
     output_mask = torch.zeros((1, 1, H, W), device=device)
     weight_matrix = torch.zeros((1, 1, H, W), device=device)
-
+    
     patches = []
     coords = []
-
+    
+    # Loop over the image using y for the vertical (height) dimension and x for horizontal (width)
     for y in range(0, H - patch_size + 1, stride):
         for x in range(0, W - patch_size + 1, stride):
-            patch = image[:, :, y:y+patch_size, x:x+patch_size]
+            # Crop using (left, upper, right, lower)
+            patch = image.crop((x, y, x + patch_size, y + patch_size))
+            patch = processor(images=patch, return_tensors="pt")["pixel_values"].to(device)
             patches.append(patch)
-            coords.append((y, x))
+            coords.append((x, y))
     
     batch_size = 32
-
     with torch.no_grad():
         for i in range(0, len(patches), batch_size):
             batch_patches = torch.cat(patches[i:i+batch_size], dim=0)
-            batch_preds = torch.sigmoid(model(batch_patches))
+            batch_preds = torch.sigmoid(model({"pixel_values": batch_patches}))
             for j, pred in enumerate(batch_preds):
-                y, x = coords[i + j]
+                x, y = coords[i + j]
+                # Note: in the tensor, dimension 2 is height and dimension 3 is width
                 output_mask[:, :, y:y+patch_size, x:x+patch_size] += pred.unsqueeze(0)
                 weight_matrix[:, :, y:y+patch_size, x:x+patch_size] += 1
 
     output_mask /= torch.clamp(weight_matrix, min=1)
     final_mask = (output_mask > 0.5)
-
+    
     return final_mask
 
 
-import matplotlib.pyplot as plt
-def train(model, train_loader, test_loader):
+def dice_loss(pred, target, smooth=1):
+    """
+    Computes the Dice Loss for binary segmentation.
+    Args:
+        pred: Tensor of predictions (batch_size, 1, H, W).
+        target: Tensor of ground truth (batch_size, 1, H, W).
+        smooth: Smoothing factor to avoid division by zero.
+    Returns:
+        Scalar Dice Loss.
+    """
+    # Apply sigmoid to convert logits to probabilities
+    pred = torch.sigmoid(pred)
+    
+    # Calculate intersection and union
+    intersection = (pred * target).sum(dim=(2, 3))
+    union = pred.sum(dim=(2, 3)) + target.sum(dim=(2, 3))
+    
+    # Compute Dice Coefficient
+    dice = (2. * intersection + smooth) / (union + smooth)
+    
+    # Return Dice Loss
+    return 1 - dice.mean()
+
+
+def train(model, train_loader, test_loader, test_loader_full):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    criterion = nn.BCEWithLogitsLoss()
+    criterion = dice_loss
     
     optimizer = optim.Adam(model.parameters(), lr=5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40, eta_min=1e-5)
+
+    best_dice = 0.0
 
     # Training loop
     num_epochs = 40
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for images, masks, _ in train_loader:
+        for _, images, masks, _ in train_loader:
             images = images.to(device)
             masks = masks.to(device)
 
             alpha = 0.01
             masks = (1 - alpha) * masks + alpha / 2
 
-            # outputs = model(images)['out']
-            outputs = call_beit(model, images)
+            outputs = model({"pixel_values": images})
             loss = criterion(outputs, masks)
             
             optimizer.zero_grad()
@@ -181,23 +144,15 @@ def train(model, train_loader, test_loader):
         
         scheduler.step()
 
-        # Validation phase
         model.eval()
         test_loss = 0.0
         dice = 0.0
         with torch.no_grad():
-            for images, masks, _ in test_loader:
+            for _, images, masks, _ in test_loader:
                 images = images.to(device)
                 masks = masks.to(device)
-
-                # Random crop during validation to match BEiT's expected input size
-                i, j, h, w = transforms.RandomCrop.get_params(images, output_size=(224, 224))
-                images = F.crop(images, i, j, h, w).contiguous()
-                masks = F.crop(masks, i, j, h, w).contiguous()
-
-                masks = (masks > 0.5).float()
                 
-                outputs = call_beit(model, images)
+                outputs = model({"pixel_values": images})
                 loss = criterion(outputs, masks)
                 test_loss += loss.item() * images.size(0)
                 dice += dice_coef(outputs, masks).item() * images.size(0)
@@ -206,29 +161,40 @@ def train(model, train_loader, test_loader):
         epoch_loss = running_loss / len(train_loader.dataset)
         dice = dice / len(test_loader.dataset)
 
+        # if test_loss < best_loss:
+        #     best_loss = test_loss
+        #     print("Saving best model..., loss:", best_loss)
+        #     best_model = deepcopy(model.state_dict())
+        #     torch.save(best_model, "best_model.pth")
+
         print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {epoch_loss:.4f}, Test Loss: {test_loss:.4f}, Dice: {dice:.4f}")
 
-    model.eval()
-    dice = 0.0
-    print("Calculating Dice Coefficient on Test Set...")
-    with torch.no_grad():
-        for images, masks, coords in test_loader:
-            images = images.to(device)
-            masks = masks.to(device)
+        # dice = 0.0
+        # print("Calculating Dice Coefficient on Test Set...")
 
-            if masks.shape[2:] != images.shape[2:]:
-                continue
+        # with torch.no_grad():
+        #     for images_paths, _, masks, coords in test_loader_full:
+        #         # images = images.to(device)
+        #         masks = masks.to(device)
 
-            outputs = sliding_window_inference(images, lambda x: call_beit(model, x), patch_size=224, stride=112, device=device)
+        #         # print(masks.shape, images.shape)
 
-            x_start, y_start, x_end, y_end = coords
-            masks_cut = masks[:, :, y_start:y_end, x_start:x_end].contiguous()
-            outputs_cut = outputs[:, :, y_start:y_end, x_start:x_end].contiguous()
+        #         outputs = sliding_window_inference(images_paths, model, processor, patch_size=384, stride=192, device=device)
+        #         # print(outputs.shape, masks.shape)
+        #         x_start, y_start, x_end, y_end = coords
+        #         masks_cut = masks[:, :, y_start:y_end, x_start:x_end].contiguous()
+        #         outputs_cut = outputs[:, :, y_start:y_end, x_start:x_end].contiguous()
 
-            dice += dice_coef(outputs_cut, masks_cut).item() * images.size(0)
+        #         dice += dice_coef(outputs_cut, masks_cut).item() * masks.size(0)
 
-    dice /= len(test_loader.dataset)
-    print("Dice Coefficient:", dice)
+        # dice /= len(test_loader.dataset)
+        # print("Dice Coefficient:", dice)
+
+        # if dice > best_dice:
+        #     best_dice = dice
+        #     print("Saving best model..., Dice Coefficient:", best_dice)
+        #     best_model = deepcopy(model.state_dict())
+        #     torch.save(best_model, f"best_model_{dice:.4f}.pth")
     # print(f"Epoch {epoch+1}/{num_epochs}, Test Loss: {8:.4f}, Dice Coefficient: {dice:.4f}")
 
 
@@ -237,9 +203,10 @@ if __name__ == "__main__":
     mask_dir = "seg-dataset/masks"
     batch_size = 16
 
-    train_loader, test_loader = get_dataloaders(image_dir, mask_dir, batch_size)
+    processor = BeitImageProcessor.from_pretrained("microsoft/beit-base-patch16-384")
+    train_loader, test_loader, test_loader_full = get_dataloader(image_dir, mask_dir, processor, batch_size)
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = get_model_beit(device)
-    
 
-    train(model, train_loader, test_loader)
+    train(model, train_loader, test_loader, test_loader_full)
