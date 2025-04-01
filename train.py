@@ -123,39 +123,33 @@ def sliding_window_inference(image, model, patch_size=256, stride=128, device='c
     output_mask = torch.zeros((1, 1, H, W), device=device)
     weight_matrix = torch.zeros((1, 1, H, W), device=device)
 
-    # List to hold patches and their coordinates
     patches = []
     coords = []
 
-    # Extract patches and store their top-left coordinates
     for y in range(0, H - patch_size + 1, stride):
         for x in range(0, W - patch_size + 1, stride):
             patch = image[:, :, y:y+patch_size, x:x+patch_size]
             patches.append(patch)
             coords.append((y, x))
     
-    # Process patches in batches of 32
     batch_size = 32
-    # model.eval()
+
     with torch.no_grad():
         for i in range(0, len(patches), batch_size):
             batch_patches = torch.cat(patches[i:i+batch_size], dim=0)
-            # Get model predictions and apply sigmoid
             batch_preds = torch.sigmoid(model(batch_patches))
-            # Iterate over predictions and add them back to the output mask
             for j, pred in enumerate(batch_preds):
                 y, x = coords[i + j]
                 output_mask[:, :, y:y+patch_size, x:x+patch_size] += pred.unsqueeze(0)
                 weight_matrix[:, :, y:y+patch_size, x:x+patch_size] += 1
 
-    # Average the overlapping regions
     output_mask /= torch.clamp(weight_matrix, min=1)
     final_mask = (output_mask > 0.5)
 
     return final_mask
 
 
-
+import matplotlib.pyplot as plt
 def train(model, train_loader, test_loader):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     criterion = nn.BCEWithLogitsLoss()
@@ -163,18 +157,14 @@ def train(model, train_loader, test_loader):
     optimizer = optim.Adam(model.parameters(), lr=5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=40, eta_min=1e-5)
 
-    print(sum(p.numel() for p in model.parameters() if p.requires_grad))
-
     # Training loop
     num_epochs = 40
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
-        for images, masks in train_loader:
+        for images, masks, _ in train_loader:
             images = images.to(device)
             masks = masks.to(device)
-
-            # images, masks = transform(images, masks)
 
             alpha = 0.01
             masks = (1 - alpha) * masks + alpha / 2
@@ -188,39 +178,58 @@ def train(model, train_loader, test_loader):
             optimizer.step()
 
             running_loss += loss.item() * images.size(0)
-        scheduler.step()
         
-        epoch_loss = running_loss / len(train_loader.dataset)
-        print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {epoch_loss:.4f}")
+        scheduler.step()
 
-        # Evaluate on the test set
+        # Validation phase
         model.eval()
-        # test_loss = 0.0
+        test_loss = 0.0
         dice = 0.0
         with torch.no_grad():
-            for images, masks in test_loader:
+            for images, masks, _ in test_loader:
                 images = images.to(device)
                 masks = masks.to(device)
-                # print(images.shape, masks.shape)
-                # images, masks = transform(images, masks)
-                if masks.shape[2:] != images.shape[2:]:
-                    # outputs = torch.nn.functional.interpolate(outputs, size=masks.shape[2:], mode='bilinear', align_corners=False)
-                    continue
 
-                # outputs = model(images)['out']
-                # outputs = call_beit(model, images)
-                # loss = criterion(outputs, masks)
-                # test_loss += loss.item() * images.size(0)
-                outputs = sliding_window_inference(images, lambda x: call_beit(model, x), patch_size=224, stride=112, device=device)
-                # print(outputs.shape)
+                # Random crop during validation to match BEiT's expected input size
+                i, j, h, w = transforms.RandomCrop.get_params(images, output_size=(224, 224))
+                images = F.crop(images, i, j, h, w).contiguous()
+                masks = F.crop(masks, i, j, h, w).contiguous()
 
-
+                masks = (masks > 0.5).float()
+                
+                outputs = call_beit(model, images)
+                loss = criterion(outputs, masks)
+                test_loss += loss.item() * images.size(0)
                 dice += dice_coef(outputs, masks).item() * images.size(0)
-        # test_loss /= len(test_loader.dataset)
-        dice /= len(test_loader.dataset)
-        print(f"Epoch {epoch+1}/{num_epochs}, Test Loss: {8:.4f}, Dice Coefficient: {dice:.4f}")
 
-    print("Training complete.")
+        test_loss = test_loss / len(test_loader.dataset)        
+        epoch_loss = running_loss / len(train_loader.dataset)
+        dice = dice / len(test_loader.dataset)
+
+        print(f"Epoch {epoch+1}/{num_epochs}, Training Loss: {epoch_loss:.4f}, Test Loss: {test_loss:.4f}, Dice: {dice:.4f}")
+
+    model.eval()
+    dice = 0.0
+    print("Calculating Dice Coefficient on Test Set...")
+    with torch.no_grad():
+        for images, masks, coords in test_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            if masks.shape[2:] != images.shape[2:]:
+                continue
+
+            outputs = sliding_window_inference(images, lambda x: call_beit(model, x), patch_size=224, stride=112, device=device)
+
+            x_start, y_start, x_end, y_end = coords
+            masks_cut = masks[:, :, y_start:y_end, x_start:x_end].contiguous()
+            outputs_cut = outputs[:, :, y_start:y_end, x_start:x_end].contiguous()
+
+            dice += dice_coef(outputs_cut, masks_cut).item() * images.size(0)
+
+    dice /= len(test_loader.dataset)
+    print("Dice Coefficient:", dice)
+    # print(f"Epoch {epoch+1}/{num_epochs}, Test Loss: {8:.4f}, Dice Coefficient: {dice:.4f}")
 
 
 if __name__ == "__main__":

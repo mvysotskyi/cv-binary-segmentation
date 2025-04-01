@@ -32,26 +32,16 @@ def pad_to_divisible(img, target_size):
     right = pad_width - left
     top = pad_height // 2
     bottom = pad_height - top
-
+    coords = (left, top, left + width, top + height)
     # Select fill color: for RGB images use black (0,0,0), for others assume 0
     fill_color = (0, 0, 0) if img.mode == 'RGB' else 0
 
     # Pad the image
     padded_img = ImageOps.expand(img, border=(left, top, right, bottom), fill=fill_color)
-    return padded_img
-
-import random
+    return padded_img, coords
 
 def joint_random_crop_and_resize(crop_size, resize_size, flip_prob=0.5):
     def transform(image, mask):
-        # Random scaling (between 0.9 and 1.1)
-        # if random.random() < 0.5:
-        #     scale_factor = 1.0 + 0.1 * torch.rand(1).item()  # Random value between 0.9 and 1.1
-        #     new_size = [int(s * scale_factor) for s in image.size]
-        #     image = F.resize(image, new_size, Image.BILINEAR)
-        #     mask = F.resize(mask, new_size, Image.NEAREST)
-        
-        # Random crop
         i, j, h, w = transforms.RandomCrop.get_params(image, output_size=crop_size)
         image = F.crop(image, i, j, h, w)
         mask = F.crop(mask, i, j, h, w)
@@ -95,8 +85,8 @@ class SegmentationDataset(Dataset):
         image = Image.open(self.image_paths[idx]).convert("RGB")
         mask = Image.open(self.mask_paths[idx]).convert("L")
 
-        mask = pad_to_divisible(mask, 224)
-        image = pad_to_divisible(image, 224)
+        mask, coords = pad_to_divisible(mask, 224)
+        image, _ = pad_to_divisible(image, 224)
 
         if self.train:
             image, mask = self.joint_transform(image, mask)
@@ -105,4 +95,4 @@ class SegmentationDataset(Dataset):
         mask = self.mask_transform(mask)
         mask = (mask > 0.5).float()
 
-        return image, mask
+        return image, mask, coords
